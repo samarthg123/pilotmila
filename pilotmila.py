@@ -7,14 +7,20 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from io import BytesIO
 import warnings
+from typing import Dict, Any # optional
 
 # just so terminal looks cleaner, csv unaffected
 warnings.filterwarnings("ignore", message="Could not get FontBBox")
+# added suppression for the detailed FontBBox message
+warnings.filterwarnings("ignore", message="Could not get FontBBox from font descriptor")
+# added suppression for the internal PDF structure error (xref table issues)
+warnings.filterwarnings("ignore", message="Not adding object")
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # constants for the timeframe of the study
 
 START_YEAR = 2004 #1995 (actual start date)
-END_YEAR = 2006 #2015 (actual end date)
+END_YEAR = 2004 #2015 (actual end date)
 OUTPUT_FOLDER = "downloads"
 RESULTS_CSV = "law_review_prelim_results.csv"
 
@@ -31,18 +37,21 @@ def download_pdf(url):
         response = requests.get(url, timeout=30)
         if response.status_code != 200:
             print(f" error: page not found ({response.status_code})")
-            return None
+            return None, None # returns tuple
         
         # using bs4 to find the actual pdf link
-
         soup = BeautifulSoup(response.text, "html.parser")
-
-        # extracting title from HTML
+        
+        # title extraction from html
         page_title = None
-        title_elem = soup.find("h1") or soup.find("h2")
-        if title_elem:
-            page_title = title_elem.get_text(strip=True)
-
+        citation_meta = soup.find("meta", {"name": "citation_title"})
+        if citation_meta:
+            page_title = citation_meta.get("content")
+        else:
+            title_elem = soup.find("h1") or soup.find("h2")
+            if title_elem:
+                page_title = title_elem.get_text(strip=True)
+        
         pdf_link = None
         for a in soup.find_all("a", href=True):
             if "viewcontent.cgi" in a["href"]:
@@ -50,29 +59,33 @@ def download_pdf(url):
                 break
         if not pdf_link:
             print(" no pdf link found on page.")
-            return None, None
+            return None, None  
         
         pdf_url = urljoin(url, pdf_link)
         print(f" downloading pdf: {pdf_url}")
 
         pdf_response = requests.get(pdf_url, timeout = 30)
         if pdf_response.status_code == 200 and 'application/pdf' in pdf_response.headers.get('Content-Type', ''):
-            return pdf_response.content, page_title
+            return pdf_response.content, page_title  # returns both PDF/title
         else:
             print(f" error: pdf not returned ({pdf_response.status_code})")
-            return None, None
+            return None, None  # returns tuple
         
     except Exception as e:
         print(f" Error: {e}")
-        return None, None
+        return None, None  # returns tuple
     
 
-def extract_pdf_metadata(pdf_content): #since most of the files from lawreviewcommons are PDFs
-    """extract pages and word count from PDF bytes"""
+def extract_pdf_metadata(pdf_content) -> Dict[str, Any] | None: #since most of the files from lawcommonsreview are PDFs
+    """
+    extracts word count and character counts from PDF bytes.
+    """
     try:
         with pdfplumber.open(BytesIO(pdf_content)) as pdf:
+            
+            # internal debugging
             num_pages = len(pdf.pages)
-
+            
             # all pages
             full_text = ""
             for page in pdf.pages:
@@ -80,24 +93,34 @@ def extract_pdf_metadata(pdf_content): #since most of the files from lawreviewco
                 if text:
                     full_text += text + " "
 
+            # for debugging below
+            if num_pages > 0 and not full_text.strip():
+                print(f" !!! WARNING: PDF has {num_pages} pages, but NO TEXT was extracted.")
+                print(" !!! This article is likely scanned (image-only) or encrypted.")
+            # for debugging above
+
             # word estimation
             word_count = len(full_text.split())
 
-            # char estimation (excluding spaces and new lines)
-            char_count = len(full_text.replace(" ", "").replace("\n", ""))
+            # char count total
+            total_char_count = len(full_text)
+            
+            # char count no spaces whitespace excluded
+            char_count_no_space = len(''.join(c for c in full_text if not c.isspace()))
 
-            #title from first page
+            # title from first page
             first_page_text = pdf.pages[0].extract_text() if pdf.pages else ""
             title = extract_title_from_text(first_page_text)
 
             return {
-                'pages': num_pages,
-                'characters': char_count,
                 'words': word_count,
+                'char_count_total': total_char_count,
+                'char_count_no_space': char_count_no_space,
                 'title': title
             }
     except Exception as e:
-        print(f" PDF parsing error: {e}")
+        # to catch general parsing errors, includes XREF/structure issues which I was running into
+        print(f" PDF parsing FATAL error (skipping article): {e}")
         return None
 
 def extract_title_from_text(text):
@@ -143,28 +166,31 @@ def scrape_duke_law_journal(start_year=1995, end_year=2015):
                 url = BASE_URL.format(volume=volume, issue=issue, article=article_num)
 
                 # attempt to download
-
-                pdf_content, page_title = download_pdf(url)
+                pdf_content, page_title = download_pdf(url)  # unpacks both values
 
                 if pdf_content:
                     metadata = extract_pdf_metadata(pdf_content)
 
                     if metadata:
-
+                        # if pdf extraction fails, uses html title
                         if metadata['title'] == "unknown title" and page_title:
                             metadata['title'] = page_title
-
-                        if metadata['words'] < 500:
-                            print(f"Skipping article {article_num} - too short ({metadata['words']} words)")
+                        
+                        # skips scanned pdfs with no words
+                        if metadata['words'] == 0:
+                            print(f" skipping article {article_num} - scanned PDF (no extractable text)")
+                            if page_title:
+                                print(f" Title from HTML: {page_title}")
                             consecutive_failures += 1
                             continue
+                        
                         # saving purposes
                         filename = f"duke_{year}_vol{volume}_iss{issue}_art{article_num}.pdf"
                         filepath = os.path.join(OUTPUT_FOLDER, filename)
                         with open(filepath, "wb") as f:
                             f.write(pdf_content)
 
-                        # storing results
+                        # storing results (uses char counts and omits pages)
 
                         results.append ({
                             'journal':'Duke Law Journal',
@@ -173,16 +199,16 @@ def scrape_duke_law_journal(start_year=1995, end_year=2015):
                             'issue': issue,
                             'article': article_num,
                             'title': metadata['title'],
-                            'pages': metadata['pages'],
                             'words': metadata['words'],
-                            'characters': metadata['characters'],
+                            'char_count_total': metadata['char_count_total'],
+                            'char_count_no_space': metadata['char_count_no_space'],
                             'url': url,
                             'filename': filename
-                            # author name, subject matter tags; for later
 
                         })
 
-                        print(f" Article {article_num}: {metadata['words']} words, {metadata['characters']} chars")
+                        # success print mssg to verify works
+                        print(f" article {article_num}: {metadata['words']} words / {metadata['char_count_no_space']} chars (no space)")
                         articles_found += 1
                         consecutive_failures = 0
                     else:
@@ -193,7 +219,7 @@ def scrape_duke_law_journal(start_year=1995, end_year=2015):
                 sleep (0.5)
 
             if articles_found == 0:
-                print(f" No articles found")
+                print(f" no articles found")
                 break 
 
     # the break above allows for moving onto the next year in case there are no articles in for ex. issue 1
@@ -204,32 +230,33 @@ def save_results(results):
 
     df = pd.DataFrame(results)
     df.to_csv(RESULTS_CSV, index=False)
-    df.to_json(RESULTS_CSV.replace('.csv', '.json'), orient='records', indent=2)
-
+    df.to_json(RESULTS_CSV.replace('.csv', '.json'), orient='records', indent=2)  # json export
+    
     print(f"\n Saved {len(results)} articles to {RESULTS_CSV}")
-    print(f"\n Also saved to {RESULTS_CSV.replace('.csv', '.json')}")
+    print(f" Also saved to {RESULTS_CSV.replace('.csv', '.json')}") # json added
 
-    # summarizing the data
+    # summarizing the data (uses chars and doesn't count pages)
 
     print(f"\n Summary:")
     print(f"Total articles: {len(results)}")
     print(f"Year range: {df['year'].min()} - {df['year'].max()}")
-    print(f"Average pages: {df['pages'].mean():.1f}")
-    print(f"Average characters: {df['characters'].mean():.0f}") # new addition of changing page count to words/chars
     print(f"Average words: {df['words'].mean():.0f}")
+    print(f"Average characters (total): {df['char_count_total'].mean():.0f}")
+    print(f"Average characters (no space): {df['char_count_no_space'].mean():.0f}")
 
-    # comparison timeline before/after 2005
+
+    # comparison timeline before/after 2005 (Updated to use new metrics)
 
     before_2005 = df[df['year'] < 2005]
     after_2005 = df[df['year'] >= 2005]
 
     print(f"\nBefore 2005: {len(before_2005)} articles")
-    print(f"  Average words: {before_2005['words'].mean():.0f}")
-    print(f"  Average characters: {before_2005['characters'].mean():.0f}")
-
+    print(f" Average words: {before_2005['words'].mean():.0f}")
+    print(f" Average chars (no space): {before_2005['char_count_no_space'].mean():.0f}")
+    
     print(f"\nAfter 2005: {len(after_2005)} articles")
-    print(f"  Average words: {after_2005['words'].mean():.0f}")
-    print(f"  Average characters: {after_2005['characters'].mean():.0f}")
+    print(f" Average words: {after_2005['words'].mean():.0f}")
+    print(f" Average chars (no space): {after_2005['char_count_no_space'].mean():.0f}")
 
     return df
 
@@ -251,12 +278,9 @@ def main():
     df = save_results(results)
 
     print(f"\n next steps:")
-    print(f"1. review {RESULTS_CSV} for data quality")
+    print(f"1. review {RESULTS_CSV} for data quality (now quantified by words/chars)")
     print(f"2. run citation scraper to see if that affects hypothesis")
     print(f"3. analyze correlation between length and citations")
 
 if __name__ == "__main__":
     main()
-
-
-# text embedding/vision model for the footers v mains (for later)
