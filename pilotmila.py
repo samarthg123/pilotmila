@@ -36,6 +36,13 @@ def download_pdf(url):
         # using bs4 to find the actual pdf link
 
         soup = BeautifulSoup(response.text, "html.parser")
+
+        # extracting title from HTML
+        page_title = None
+        title_elem = soup.find("h1") or soup.find("h2")
+        if title_elem:
+            page_title = title_elem.get_text(strip=True)
+
         pdf_link = None
         for a in soup.find_all("a", href=True):
             if "viewcontent.cgi" in a["href"]:
@@ -43,24 +50,24 @@ def download_pdf(url):
                 break
         if not pdf_link:
             print(" no pdf link found on page.")
-            return None
+            return None, None
         
         pdf_url = urljoin(url, pdf_link)
         print(f" downloading pdf: {pdf_url}")
 
         pdf_response = requests.get(pdf_url, timeout = 30)
         if pdf_response.status_code == 200 and 'application/pdf' in pdf_response.headers.get('Content-Type', ''):
-            return pdf_response.content
+            return pdf_response.content, page_title
         else:
             print(f" error: pdf not returned ({pdf_response.status_code})")
-            return None
+            return None, None
         
     except Exception as e:
         print(f" Error: {e}")
-        return None
+        return None, None
     
 
-def extract_pdf_metadata(pdf_content): #since most of the files from lawcommonsreview are PDFs
+def extract_pdf_metadata(pdf_content): #since most of the files from lawreviewcommons are PDFs
     """extract pages and word count from PDF bytes"""
     try:
         with pdfplumber.open(BytesIO(pdf_content)) as pdf:
@@ -76,12 +83,16 @@ def extract_pdf_metadata(pdf_content): #since most of the files from lawcommonsr
             # word estimation
             word_count = len(full_text.split())
 
+            # char estimation (excluding spaces and new lines)
+            char_count = len(full_text.replace(" ", "").replace("\n", ""))
+
             #title from first page
             first_page_text = pdf.pages[0].extract_text() if pdf.pages else ""
             title = extract_title_from_text(first_page_text)
 
             return {
                 'pages': num_pages,
+                'characters': char_count,
                 'words': word_count,
                 'title': title
             }
@@ -133,12 +144,20 @@ def scrape_duke_law_journal(start_year=1995, end_year=2015):
 
                 # attempt to download
 
-                pdf_content = download_pdf(url)
+                pdf_content, page_title = download_pdf(url)
 
                 if pdf_content:
                     metadata = extract_pdf_metadata(pdf_content)
 
                     if metadata:
+
+                        if metadata['title'] == "unknown title" and page_title:
+                            metadata['title'] = page_title
+
+                        if metadata['words'] < 500:
+                            print(f"Skipping article {article_num} - too short ({metadata['words']} words)")
+                            consecutive_failures += 1
+                            continue
                         # saving purposes
                         filename = f"duke_{year}_vol{volume}_iss{issue}_art{article_num}.pdf"
                         filepath = os.path.join(OUTPUT_FOLDER, filename)
@@ -156,12 +175,14 @@ def scrape_duke_law_journal(start_year=1995, end_year=2015):
                             'title': metadata['title'],
                             'pages': metadata['pages'],
                             'words': metadata['words'],
+                            'characters': metadata['characters'],
                             'url': url,
                             'filename': filename
+                            # author name, subject matter tags; for later
 
                         })
 
-                        print(f" Article {article_num}: {metadata['pages']} pages")
+                        print(f" Article {article_num}: {metadata['words']} words, {metadata['characters']} chars")
                         articles_found += 1
                         consecutive_failures = 0
                     else:
@@ -183,14 +204,18 @@ def save_results(results):
 
     df = pd.DataFrame(results)
     df.to_csv(RESULTS_CSV, index=False)
+    df.to_json(RESULTS_CSV.replace('.csv', '.json'), orient='records', indent=2)
+
     print(f"\n Saved {len(results)} articles to {RESULTS_CSV}")
+    print(f"\n Also saved to {RESULTS_CSV.replace('.csv', '.json')}")
 
     # summarizing the data
 
     print(f"\n Summary:")
     print(f"Total articles: {len(results)}")
     print(f"Year range: {df['year'].min()} - {df['year'].max()}")
-    print(f"Average pages: {df['pages'].mean():.1f}") # just to look cleaner
+    print(f"Average pages: {df['pages'].mean():.1f}")
+    print(f"Average characters: {df['characters'].mean():.0f}") # new addition of changing page count to words/chars
     print(f"Average words: {df['words'].mean():.0f}")
 
     # comparison timeline before/after 2005
@@ -198,8 +223,13 @@ def save_results(results):
     before_2005 = df[df['year'] < 2005]
     after_2005 = df[df['year'] >= 2005]
 
-    print(f"\nBefore 2005: {len(before_2005)} articles, avg {before_2005['pages'].mean():.1f} pages")
-    print(f"After 2005: {len(after_2005)} articles, avg {after_2005['pages'].mean():.1f} pages")
+    print(f"\nBefore 2005: {len(before_2005)} articles")
+    print(f"  Average words: {before_2005['words'].mean():.0f}")
+    print(f"  Average characters: {before_2005['characters'].mean():.0f}")
+
+    print(f"\nAfter 2005: {len(after_2005)} articles")
+    print(f"  Average words: {after_2005['words'].mean():.0f}")
+    print(f"  Average characters: {after_2005['characters'].mean():.0f}")
 
     return df
 
@@ -227,3 +257,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# text embedding/vision model for the footers v mains (for later)
