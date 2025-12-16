@@ -7,42 +7,45 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from io import BytesIO
 import warnings
-from typing import Dict, Any # optional
+from typing import Dict, Any
+from pdf2image import convert_from_bytes
+import pytesseract
 
 # just so terminal looks cleaner, csv unaffected
 warnings.filterwarnings("ignore", message="Could not get FontBBox")
-# added suppression for the detailed FontBBox message
 warnings.filterwarnings("ignore", message="Could not get FontBBox from font descriptor")
-# added suppression for the internal PDF structure error (xref table issues)
 warnings.filterwarnings("ignore", message="Not adding object")
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # constants for the timeframe of the study
-
 START_YEAR = 2004 #1995 (actual start date)
-END_YEAR = 2004 #2015 (actual end date)
+END_YEAR = 2006 #2015 (actual end date)
 OUTPUT_FOLDER = "downloads"
 RESULTS_CSV = "law_review_prelim_results.csv"
 
 # implementation for general url pattern for duke law review journals
-
 BASE_URL = "https://scholarship.law.duke.edu/dlj/vol{volume}/iss{issue}/{article}/"
+DUKE_JOURNAL_START_YEAR = 1951
+
+# pepperdine law review URL and journal start date
+PEPPERDINE_BASE_URL = "https://digitalcommons.pepperdine.edu/plr/vol{volume}/iss{issue}/{article}/"
+PEPPERDINE_JOURNAL_START_YEAR = 1974 # plr start year similar to duke 1951
 
 # simple functions
 
 def download_pdf(url):
-    """download PDF from URL and return info"""
+    """download PDF from URL and return info (now includes author metadata)""" # <--- MODIFIED DOCSTRING
     try:
         print(f" downloading: {url}")
         response = requests.get(url, timeout=30)
         if response.status_code != 200:
             print(f" error: page not found ({response.status_code})")
-            return None, None # returns tuple
+            return None, None, None, None 
         
         # using bs4 to find the actual pdf link
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # title extraction from html
+        # title extraction from html (existing logic)
         page_title = None
         citation_meta = soup.find("meta", {"name": "citation_title"})
         if citation_meta:
@@ -52,6 +55,15 @@ def download_pdf(url):
             if title_elem:
                 page_title = title_elem.get_text(strip=True)
         
+        # author metadata extraction
+        author_meta_tags = soup.find_all("meta", {"name": "citation_author"})
+        authors = [tag.get("content") for tag in author_meta_tags if tag.get("content")]
+        
+        author_count = len(authors) # finds author count length
+        is_multi_author = author_count > 1 # identifies if multi-author or not
+        authors_string = " and ".join(authors) if authors else "Unknown Author" # checks to see author string
+        
+        # pdf link extraction (existing logic)
         pdf_link = None
         for a in soup.find_all("a", href=True):
             if "viewcontent.cgi" in a["href"]:
@@ -59,27 +71,60 @@ def download_pdf(url):
                 break
         if not pdf_link:
             print(" no pdf link found on page.")
-            return None, None  
+            return None, None, None, None
         
         pdf_url = urljoin(url, pdf_link)
         print(f" downloading pdf: {pdf_url}")
 
-        pdf_response = requests.get(pdf_url, timeout = 30)
+        pdf_response = requests.get(pdf_url, timeout=30)
         if pdf_response.status_code == 200 and 'application/pdf' in pdf_response.headers.get('Content-Type', ''):
-            return pdf_response.content, page_title  # returns both PDF/title
+            return pdf_response.content, page_title, authors_string, is_multi_author # modified return to include authors_string and is_multi_author
         else:
             print(f" error: pdf not returned ({pdf_response.status_code})")
-            return None, None  # returns tuple
+            return None, None, None, None
         
     except Exception as e:
         print(f" Error: {e}")
-        return None, None  # returns tuple
-    
+        return None, None, None, None
 
-def extract_pdf_metadata(pdf_content) -> Dict[str, Any] | None: #since most of the files from lawcommonsreview are PDFs
-    """
-    extracts word count and character counts from PDF bytes.
-    """
+
+def ocr_scanned_pdf(pdf_content):
+    # OCR for scanned pdfs using pdf2image + pytesseract
+    # converts PDF to images then extracts text using OCR
+   
+    try:
+        print(f" running OCR (this may take a few seconds...")
+        
+        # convert PDF bytes to images
+        images = convert_from_bytes(pdf_content, poppler_path='/opt/homebrew/bin')
+        
+        full_text = ""
+        for page_num, image in enumerate(images, 1):
+            print(f" Processing page {page_num}/{len(images)}...")
+            # OCR each page
+            text = pytesseract.image_to_string(image)
+            full_text += text + " "
+        
+        # calculate metrics
+        word_count = len(full_text.split())
+        char_count_total = len(full_text)
+        char_count_no_space = len(''.join(c for c in full_text if not c.isspace()))
+        
+        return {
+            'words': word_count,
+            'char_count_total': char_count_total,
+            'char_count_no_space': char_count_no_space,
+            'ocr_used': True
+        }
+    except Exception as e:
+        print(f" OCR failed: {e}")
+        return None
+
+
+def extract_pdf_metadata(pdf_content):
+    
+    # extracts word count and character counts from PDF bytes.
+    
     try:
         with pdfplumber.open(BytesIO(pdf_content)) as pdf:
             
@@ -95,9 +140,8 @@ def extract_pdf_metadata(pdf_content) -> Dict[str, Any] | None: #since most of t
 
             # for debugging below
             if num_pages > 0 and not full_text.strip():
-                print(f" !!! WARNING: PDF has {num_pages} pages, but NO TEXT was extracted.")
-                print(" !!! This article is likely scanned (image-only) or encrypted.")
-            # for debugging above
+                print(f" WARNING: PDF has {num_pages} pages, but NO TEXT was extracted.")
+                print(" article is likely scanned (image-only) - will attempt OCR.")
 
             # word estimation
             word_count = len(full_text.split())
@@ -116,15 +160,16 @@ def extract_pdf_metadata(pdf_content) -> Dict[str, Any] | None: #since most of t
                 'words': word_count,
                 'char_count_total': total_char_count,
                 'char_count_no_space': char_count_no_space,
-                'title': title
+                'title': title,
+                'ocr_used': False
             }
     except Exception as e:
-        # to catch general parsing errors, includes XREF/structure issues which I was running into
-        print(f" PDF parsing FATAL error (skipping article): {e}")
+        print(f" PDF parsing FATAL error: {e}")
         return None
 
+
 def extract_title_from_text(text):
-    """attempt to extract article title from first page text"""
+    # attempt to extract article title from first page text
     if not text:
         return "unknown title"
     
@@ -135,38 +180,36 @@ def extract_title_from_text(text):
     
     return lines[0] if lines else "unknown title"
 
-def scrape_duke_law_journal(start_year=1995, end_year=2015):
-    #duke law journal started 1951 and usually 6 issues per year/multiple artciles per issue
-    print(f" scraping duke law journal ({start_year}---{end_year})")
+
+def scrape_law_journal(journal_name, base_url, journal_start_year, start_year, end_year): # changed input params here
+    # generic scraping function for digital common journals to work for both 
+    print(f" scraping {journal_name} ({start_year}---{end_year})") 
     print(f" saving downloads to: {OUTPUT_FOLDER}/\n")
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
     results = []
 
-    # volume calc
-    # vol 1 = 1951 (when duke law journal began) ==> Vol X = 1951 + (X-1), hence year Y, vol = (Y - 1951) + 1
-
     for year in range(start_year, end_year + 1):
-        volume = year - 1951 + 1
+        # volume calc based on specific journal start year
+        volume = year - journal_start_year + 1 # logic for general law journal scraper for consistency between duke and pepperdine
         print(f"\n Year {year} (Volume {volume})")
 
-        for issue in range (1, 7):
+        for issue in range(1, 7):
             print(f" Issue {issue}:")
 
-            # trying for articles 1-20 since most issues have <20 articles
             articles_found = 0
             consecutive_failures = 0
 
             for article_num in range(1, 21):
-                # stopping if hit at least 3 404 errors
                 if consecutive_failures >= 3:
                     break
 
-                url = BASE_URL.format(volume=volume, issue=issue, article=article_num)
+                # use the provided base_url
+                url = base_url.format(volume=volume, issue=issue, article=article_num) # more generic
 
-                # attempt to download
-                pdf_content, page_title = download_pdf(url)  # unpacks both values
+                # now includes author data
+                pdf_content, page_title, authors_string, is_multi_author = download_pdf(url) # modified func call
 
                 if pdf_content:
                     metadata = extract_pdf_metadata(pdf_content)
@@ -176,39 +219,51 @@ def scrape_duke_law_journal(start_year=1995, end_year=2015):
                         if metadata['title'] == "unknown title" and page_title:
                             metadata['title'] = page_title
                         
-                        # skips scanned pdfs with no words
+                        # OCR handling for scanned PDFs
                         if metadata['words'] == 0:
-                            print(f" skipping article {article_num} - scanned PDF (no extractable text)")
-                            if page_title:
-                                print(f" Title from HTML: {page_title}")
-                            consecutive_failures += 1
-                            continue
+                            print(f"  Scanned PDF detected 0 words - trying OCR...")
+                            ocr_result = ocr_scanned_pdf(pdf_content)
+                            
+                            if ocr_result and ocr_result['words'] > 0:
+                                # updates metadata with OCR results with accurate words
+                                metadata['words'] = ocr_result['words']
+                                metadata['char_count_total'] = ocr_result['char_count_total']
+                                metadata['char_count_no_space'] = ocr_result['char_count_no_space']
+                                metadata['ocr_used'] = True
+                                print(f" OCR successful: {metadata['words']} words extracted")
+                            else:
+                                print(f" OCR failed - skipping article {article_num}")
+                                consecutive_failures += 1
+                                continue
                         
                         # saving purposes
-                        filename = f"duke_{year}_vol{volume}_iss{issue}_art{article_num}.pdf"
+                        filename = f"{journal_name.replace(' ', '_').lower()}_{year}_vol{volume}_iss{issue}_art{article_num}.pdf" # modified file name
                         filepath = os.path.join(OUTPUT_FOLDER, filename)
                         with open(filepath, "wb") as f:
                             f.write(pdf_content)
 
                         # storing results (uses char counts and omits pages)
-
-                        results.append ({
-                            'journal':'Duke Law Journal',
+                        results.append({
+                            'journal': journal_name, 
                             'year': year,
                             'volume': volume,
                             'issue': issue,
                             'article': article_num,
                             'title': metadata['title'],
+                            'authors': authors_string,
+                            'multi_author': is_multi_author,
                             'words': metadata['words'],
                             'char_count_total': metadata['char_count_total'],
                             'char_count_no_space': metadata['char_count_no_space'],
+                            'ocr_used': metadata.get('ocr_used', False),
                             'url': url,
                             'filename': filename
-
                         })
 
-                        # success print mssg to verify works
-                        print(f" article {article_num}: {metadata['words']} words / {metadata['char_count_no_space']} chars (no space)")
+                        # success print msg to verify works
+                        ocr_marker = " [OCR]" if metadata.get('ocr_used') else ""
+                        author_marker = " [Multi-Author]" if is_multi_author else "" # new print marker for multi-authorship
+                        print(f" Article {article_num}: {metadata['words']} words / {metadata['char_count_no_space']} chars{ocr_marker}{author_marker}") # <--- MODIFIED PRINT
                         articles_found += 1
                         consecutive_failures = 0
                     else:
@@ -216,71 +271,99 @@ def scrape_duke_law_journal(start_year=1995, end_year=2015):
                 else:
                     consecutive_failures += 1
                 
-                sleep (0.5)
+                sleep(0.5)
 
             if articles_found == 0:
                 print(f" no articles found")
-                break 
-
-    # the break above allows for moving onto the next year in case there are no articles in for ex. issue 1
+                break
 
     return results
+
+# removed scrape_duke_law_journal here and replaced by generic scrape_law_journal to test against any other law review journal
 
 def save_results(results):
 
     df = pd.DataFrame(results)
     df.to_csv(RESULTS_CSV, index=False)
-    df.to_json(RESULTS_CSV.replace('.csv', '.json'), orient='records', indent=2)  # json export
+    df.to_json(RESULTS_CSV.replace('.csv', '.json'), orient='records', indent=2)
     
     print(f"\n Saved {len(results)} articles to {RESULTS_CSV}")
-    print(f" Also saved to {RESULTS_CSV.replace('.csv', '.json')}") # json added
+    print(f" Also saved to {RESULTS_CSV.replace('.csv', '.json')}")
 
-    # summarizing the data (uses chars and doesn't count pages)
-
+    # summarizing the data
     print(f"\n Summary:")
-    print(f"Total articles: {len(results)}")
-    print(f"Year range: {df['year'].min()} - {df['year'].max()}")
-    print(f"Average words: {df['words'].mean():.0f}")
-    print(f"Average characters (total): {df['char_count_total'].mean():.0f}")
-    print(f"Average characters (no space): {df['char_count_no_space'].mean():.0f}")
-
-
-    # comparison timeline before/after 2005 (Updated to use new metrics)
-
+    print(f"total articles: {len(results)}")
+    print(f"year range: {df['year'].min()} - {df['year'].max()}")
+    print(f"average words: {df['words'].mean():.0f}")
+    print(f"average characters (total): {df['char_count_total'].mean():.0f}")
+    print(f"average characters (no space): {df['char_count_no_space'].mean():.0f}")
+    
+    # OCR stats
+    ocr_count = df['ocr_used'].sum()
+    print(f"\nOCR stats:")
+    print(f" articles processed with OCR: {ocr_count}")
+    print(f" articles with direct text extraction: {len(df) - ocr_count}")
+    
+    # **NEW SUMMARY STATS:** Author counts
+    multi_author_count = df['multi_author'].sum()
+    print(f"\nAuthor Stats:")
+    print(f" articles with multiple authors: {multi_author_count}")
+    print(f" articles with single author: {len(df) - multi_author_count}")
+    
+    # comparison timeline before/after 2005
     before_2005 = df[df['year'] < 2005]
     after_2005 = df[df['year'] >= 2005]
 
-    print(f"\nBefore 2005: {len(before_2005)} articles")
-    print(f" Average words: {before_2005['words'].mean():.0f}")
-    print(f" Average chars (no space): {before_2005['char_count_no_space'].mean():.0f}")
+    print(f"\nbefore 2005: {len(before_2005)} articles")
+    print(f" average words: {before_2005['words'].mean():.0f}")
+    print(f" average chars (no space): {before_2005['char_count_no_space'].mean():.0f}")
     
-    print(f"\nAfter 2005: {len(after_2005)} articles")
-    print(f" Average words: {after_2005['words'].mean():.0f}")
-    print(f" Average chars (no space): {after_2005['char_count_no_space'].mean():.0f}")
+    print(f"\nafter 2005: {len(after_2005)} articles")
+    print(f" average words: {after_2005['words'].mean():.0f}")
+    print(f" average chars (no space): {after_2005['char_count_no_space'].mean():.0f}")
 
     return df
 
 
 # main function
-
 def main():
     print("=" * 60)
-    print("law review length analysis")
+    print("law review length analysis (with OCR)")
     print("=" * 60)
+    
+    # 1. scrape Duke law journal
+    duke_results = scrape_law_journal(
+        journal_name='Duke Law Journal',
+        base_url=BASE_URL,
+        journal_start_year=DUKE_JOURNAL_START_YEAR,
+        start_year=START_YEAR,
+        end_year=END_YEAR
+    )
 
-    # scrape articles
-    results = scrape_duke_law_journal(START_YEAR, END_YEAR)
+    # 2. scrape Pepperdine law journal (new)
+    pepperdine_results = scrape_law_journal(
+        journal_name='Pepperdine Law Review',
+        base_url=PEPPERDINE_BASE_URL,
+        journal_start_year=PEPPERDINE_JOURNAL_START_YEAR,
+        start_year=START_YEAR,
+        end_year=END_YEAR
+    )
+    
+    # combine results into csv
+    results = duke_results + pepperdine_results
 
     if not results:
-        print("no articles found. check url pattern.")
+        print("no articles found. check url patterns and start years.")
         return
     
     df = save_results(results)
 
     print(f"\n next steps:")
-    print(f"1. review {RESULTS_CSV} for data quality (now quantified by words/chars)")
-    print(f"2. run citation scraper to see if that affects hypothesis")
-    print(f"3. analyze correlation between length and citations")
+    print(f"1. review {RESULTS_CSV} for data quality (now quantified by words/chars and author data)")
+    print(f"2. **TBD** resolve Poppler/OCR installation and path configuration.") # need to resolve this for imports/bash level to test OCR
+    print(f"3. run citation scraper to see if that affects hypothesis")
+    print(f"4. analyze correlation between length and citations, also considering multi-author trends.") # considering multi-authorship trends too
+
 
 if __name__ == "__main__":
     main()
