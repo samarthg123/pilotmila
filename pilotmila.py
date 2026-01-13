@@ -2,6 +2,7 @@ import requests
 import pdfplumber
 import pandas as pd
 import os
+import json
 from time import sleep
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -19,7 +20,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # constants for the timeframe of the study
 START_YEAR = 2004 #1995 (actual start date)
-END_YEAR = 2006 #2015 (actual end date)
+END_YEAR = 2004 #2015 (actual end date)
 OUTPUT_FOLDER = "downloads"
 RESULTS_CSV = "law_review_prelim_results.csv"
 
@@ -55,13 +56,33 @@ def download_pdf(url):
             if title_elem:
                 page_title = title_elem.get_text(strip=True)
         
-        # author metadata extraction
+        # author metadata extraction (works for both Duke and Pepperdine)
+        authors = []
+        
+        # Method 1: Try citation_author meta tags (Duke)
         author_meta_tags = soup.find_all("meta", {"name": "citation_author"})
         authors = [tag.get("content") for tag in author_meta_tags if tag.get("content")]
         
-        author_count = len(authors) # finds author count length
-        is_multi_author = author_count > 1 # identifies if multi-author or not
-        authors_string = " and ".join(authors) if authors else "Unknown Author" # checks to see author string
+        # Method 2: If no meta tags found, try Pepperdine HTML structure
+        # Look for author links in the "Authors" section
+        if not authors:
+            author_links = soup.find_all("a", href=True)
+            seen_authors = set()
+            for link in author_links:
+                href = link.get("href", "")
+                if "author=" in href or "q=author" in href:
+                    author_name = link.get_text(strip=True)
+                    if author_name and author_name not in seen_authors:
+                        authors.append(author_name)
+                        seen_authors.add(author_name)
+        
+        author_count = len(authors)
+        is_multi_author = author_count > 1
+        authors_string = " and ".join(authors) if authors else "Unknown Author"
+        
+        # DEBUG: Print what we found
+        if author_count > 0:
+            print(f"  Authors found: {authors_string} (count: {author_count})")
         
         # pdf link extraction (existing logic)
         pdf_link = None
@@ -279,7 +300,125 @@ def scrape_law_journal(journal_name, base_url, journal_start_year, start_year, e
 
     return results
 
-# removed scrape_duke_law_journal here and replaced by generic scrape_law_journal to test against any other law review journal
+# author metadata generation and analysis
+
+
+def generate_author_metadata_json(df, output_filename='author_metadata.json'):
+    """
+    Creates structured JSON of author data for trend analysis.
+    Enables analysis of multi-author vs single-author patterns.
+    """
+    author_metadata = {
+        'metadata': {
+            'total_articles': len(df),
+            'analysis_period': f"{int(df['year'].min())}-{int(df['year'].max())}",
+            'journals': list(df['journal'].unique())
+        },
+        'authorship_summary': {
+            'multi_author_count': int(df['multi_author'].sum()),
+            'single_author_count': int((~df['multi_author']).sum()),
+            'multi_author_percentage': float((df['multi_author'].sum() / len(df)) * 100),
+        },
+        'authorship_by_year': {},
+        'authorship_by_journal': {},
+        'articles': []
+    }
+    
+    # Breakdown by year
+    for year in sorted(df['year'].unique()):
+        year_data = df[df['year'] == year]
+        multi_count = year_data['multi_author'].sum()
+        author_metadata['authorship_by_year'][int(year)] = {
+            'total_articles': len(year_data),
+            'multi_author': int(multi_count),
+            'single_author': int(len(year_data) - multi_count),
+            'multi_author_percentage': float((multi_count / len(year_data)) * 100) if len(year_data) > 0 else 0,
+            'avg_words_multi': float(year_data[year_data['multi_author']]['words'].mean()) if multi_count > 0 else None,
+            'avg_words_single': float(year_data[~year_data['multi_author']]['words'].mean()) if (len(year_data) - multi_count) > 0 else None,
+        }
+    
+    # Breakdown by journal
+    for journal in df['journal'].unique():
+        journal_data = df[df['journal'] == journal]
+        multi_count = journal_data['multi_author'].sum()
+        author_metadata['authorship_by_journal'][journal] = {
+            'total_articles': len(journal_data),
+            'multi_author': int(multi_count),
+            'single_author': int(len(journal_data) - multi_count),
+            'multi_author_percentage': float((multi_count / len(journal_data)) * 100) if len(journal_data) > 0 else 0,
+            'avg_words_multi': float(journal_data[journal_data['multi_author']]['words'].mean()) if multi_count > 0 else None,
+            'avg_words_single': float(journal_data[~journal_data['multi_author']]['words'].mean()) if (len(journal_data) - multi_count) > 0 else None,
+        }
+    
+    # Individual article records
+    for _, row in df.iterrows():
+        article = {
+            'title': row['title'],
+            'authors': row['authors'],
+            'author_count': 2 if row['multi_author'] else 1,
+            'is_multi_author': bool(row['multi_author']),
+            'journal': row['journal'],
+            'year': int(row['year']),
+            'volume': int(row['volume']),
+            'issue': int(row['issue']),
+            'article_number': int(row['article']),
+            'words': int(row['words']),
+            'char_count_no_space': int(row['char_count_no_space']),
+            'ocr_used': bool(row['ocr_used']),
+            'url': row['url']
+        }
+        author_metadata['articles'].append(article)
+    
+    # Save to JSON
+    with open(output_filename, 'w') as f:
+        json.dump(author_metadata, f, indent=2)
+    
+    print(f"\n✓ Author metadata saved to {output_filename}")
+    return author_metadata
+
+
+def analyze_authorship_trends(df):
+    """
+    Analyzes trends between multi-author and single-author articles.
+    """
+    print("\n" + "="*60)
+    print("AUTHORSHIP TREND ANALYSIS")
+    print("="*60)
+    
+    # Overall stats
+    multi_author_df = df[df['multi_author']]
+    single_author_df = df[~df['multi_author']]
+    
+    print(f"\nOVERALL STATISTICS:")
+    print(f"  Total articles: {len(df)}")
+    print(f"  Multi-author articles: {len(multi_author_df)} ({len(multi_author_df)/len(df)*100:.1f}%)")
+    print(f"  Single-author articles: {len(single_author_df)} ({len(single_author_df)/len(df)*100:.1f}%)")
+    
+    # Word count comparison
+    print(f"\nWORD COUNT COMPARISON:")
+    print(f"  Multi-author avg: {multi_author_df['words'].mean():.0f} words")
+    print(f"  Single-author avg: {single_author_df['words'].mean():.0f} words")
+    print(f"  Difference: {multi_author_df['words'].mean() - single_author_df['words'].mean():.0f} words")
+    
+    # Character count comparison
+    print(f"\nCHARACTER COUNT COMPARISON:")
+    print(f"  Multi-author avg: {multi_author_df['char_count_no_space'].mean():.0f} chars")
+    print(f"  Single-author avg: {single_author_df['char_count_no_space'].mean():.0f} chars")
+    
+    # Year-over-year trend
+    print(f"\nMULTI-AUTHORSHIP TREND BY YEAR:")
+    for year in sorted(df['year'].unique()):
+        year_data = df[df['year'] == year]
+        multi_pct = (year_data['multi_author'].sum() / len(year_data)) * 100
+        print(f"  {int(year)}: {multi_pct:.1f}% multi-author")
+    
+    # Journal comparison
+    print(f"\nMULTI-AUTHORSHIP BY JOURNAL:")
+    for journal in df['journal'].unique():
+        journal_data = df[df['journal'] == journal]
+        multi_pct = (journal_data['multi_author'].sum() / len(journal_data)) * 100
+        print(f"  {journal}: {multi_pct:.1f}% multi-author")
+
 
 def save_results(results):
 
@@ -322,6 +461,12 @@ def save_results(results):
     print(f" average words: {after_2005['words'].mean():.0f}")
     print(f" average chars (no space): {after_2005['char_count_no_space'].mean():.0f}")
 
+    # NEW: Generate author metadata JSON and analysis
+    print("\n" + "="*60)
+    generate_author_metadata_json(df)
+    analyze_authorship_trends(df)
+    print("="*60)
+
     return df
 
 
@@ -360,9 +505,9 @@ def main():
 
     print(f"\n next steps:")
     print(f"1. review {RESULTS_CSV} for data quality (now quantified by words/chars and author data)")
-    print(f"2. **TBD** resolve Poppler/OCR installation and path configuration.") # need to resolve this for imports/bash level to test OCR
+    print(f"2. resolve Poppler/OCR installation and path configuration.") 
     print(f"3. run citation scraper to see if that affects hypothesis")
-    print(f"4. analyze correlation between length and citations, also considering multi-author trends.") # considering multi-authorship trends too
+    print(f"4. analyze correlation between length and citations, also considering multi-author trends.") 
 
 
 if __name__ == "__main__":
