@@ -80,7 +80,7 @@ def download_pdf(url):
         is_multi_author = author_count > 1
         authors_string = " and ".join(authors) if authors else "Unknown Author"
         
-        # DEBUG: Print what we found
+        # print what we found
         if author_count > 0:
             print(f"  Authors found: {authors_string} (count: {author_count})")
         
@@ -304,10 +304,7 @@ def scrape_law_journal(journal_name, base_url, journal_start_year, start_year, e
 
 
 def generate_author_metadata_json(df, output_filename='author_metadata.json'):
-    """
-    Creates structured JSON of author data for trend analysis.
-    Enables analysis of multi-author vs single-author patterns.
-    """
+    # Creates structured JSON of author metadata for trend analysis (solo vs. multi author)
     author_metadata = {
         'metadata': {
             'total_articles': len(df),
@@ -378,11 +375,9 @@ def generate_author_metadata_json(df, output_filename='author_metadata.json'):
 
 
 def analyze_authorship_trends(df):
-    """
-    Analyzes trends between multi-author and single-author articles.
-    """
+    # trend analysis between multi and solo authors
     print("\n" + "="*60)
-    print("AUTHORSHIP TREND ANALYSIS")
+    print("Authorship Trend Analysis")
     print("="*60)
     
     # Overall stats
@@ -443,7 +438,7 @@ def save_results(results):
     print(f" articles processed with OCR: {ocr_count}")
     print(f" articles with direct text extraction: {len(df) - ocr_count}")
     
-    # **NEW SUMMARY STATS:** Author counts
+    # Author counts
     multi_author_count = df['multi_author'].sum()
     print(f"\nAuthor Stats:")
     print(f" articles with multiple authors: {multi_author_count}")
@@ -461,7 +456,7 @@ def save_results(results):
     print(f" average words: {after_2005['words'].mean():.0f}")
     print(f" average chars (no space): {after_2005['char_count_no_space'].mean():.0f}")
 
-    # NEW: Generate author metadata JSON and analysis
+    # generate author metadata JSON and analysis
     print("\n" + "="*60)
     generate_author_metadata_json(df)
     analyze_authorship_trends(df)
