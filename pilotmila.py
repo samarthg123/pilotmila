@@ -77,7 +77,7 @@ class LawReviewClassifier:
         result = self._step_c_student_check(paper_data, result, publication_year)
         
         # length-based validation
-        result = self._step_d_validation(result)
+        result = self._step_d_validation(paper_data, result)
         
         # LLM fallback for ERROR
         if result['label'] == 'ERROR':
@@ -94,20 +94,21 @@ class LawReviewClassifier:
     def _step_a_preprocessing(self, paper_data: Dict, result: Dict) -> Dict:
         # filters short papers (read above)
         pages = paper_data.get('pages', 0)
+        words = paper_data.get('words', 0)
         
-        if pages <= 3:
+        if pages <= 3 or words <= 3000:
             result['label'] = 'Misc'
             result['steps'].append({
                 'step': 'A',
                 'name': 'Pre-Processing Filter',
-                'rule': f'Pages ({pages}) ≤ 3',
+                'rule': f'Pages ({pages}) ≤ 3 OR Words ({words}) ≤ 3000',
                 'action': 'Label Misc'
             })
         else:
             result['steps'].append({
                 'step': 'A',
                 'name': 'Pre-Processing Filter',
-                'rule': f'Pages ({pages}) > 3',
+                'rule': f'Pages ({pages}) > 3 AND Words ({words}) > 3000',
                 'action': 'Continue to next step'
             })
         
@@ -191,15 +192,15 @@ class LawReviewClassifier:
         if result['label'] != 'Unlabeled':
             return result
         
-        authors = paper_data.get('authors', '')
+        main_text = paper_data.get('main_text', '').lower()
         word_count = paper_data.get('words', 0)
         
-        jd_candidate_match = 'J.D. Candidate' in authors
+        jd_candidate_match = 'j.d. candidate' in main_text
         class_year_match = False
         
         if not jd_candidate_match:
-            class_pattern = r'Class of (\d{4})'
-            class_matches = re.findall(class_pattern, authors)
+            class_pattern = r'class of (\d{4})'
+            class_matches = re.findall(class_pattern, main_text)
             for class_year_str in class_matches:
                 try:
                     class_year = int(class_year_str)
@@ -233,10 +234,10 @@ class LawReviewClassifier:
         result['steps'].append(step_info)
         return result
     
-    def _step_d_validation(self, result: Dict) -> Dict:
+    def _step_d_validation(self, paper_data: Dict, result: Dict) -> Dict:
         # final step: validate and refine labels based on WC thresholds
 
-        word_count = result.get('word_count', 0)  # will be added by classify()
+        word_count = paper_data.get('words', 0)
         current_label = result['label']
         
         # length-based assignments if still unlabeled
@@ -247,12 +248,12 @@ class LawReviewClassifier:
             'Note': (lambda wc: wc < 18000, 'Note (confirmed)', 'ERROR'),
             'Comment': (lambda wc: wc < 10000, 'Comment (confirmed)', 'ERROR'),
             'Note_OR_Comment': (lambda wc: ('Comment' if wc < 10000 else ('Note' if 10000 <= wc <= 20000 else 'ERROR')), None, None),
-            'Unlabeled': (lambda wc: wc > 18000, 'Article', 'ERROR'),
+            'Unlabeled': (lambda wc: ('Article' if wc > 18000 else ('Note' if wc >= 10000 else 'Comment')), None, None),
             'Miscellaneous': (lambda wc: True, 'Miscellaneous', 'Miscellaneous'),
         }
         
         if current_label in validation_table:
-            if current_label == 'Note_OR_Comment':
+            if current_label == 'Note_OR_Comment' or current_label == 'Unlabeled':
                 condition_fn, _, _ = validation_table[current_label]
                 final_label = condition_fn(word_count)
             else:
@@ -264,7 +265,7 @@ class LawReviewClassifier:
                 'name': 'Validation (Length-Based Refinement)',
                 'current_label': current_label,
                 'word_count': word_count,
-                'condition_met': condition_fn(word_count) if current_label != 'Note_OR_Comment' else None,
+                'condition_met': condition_fn(word_count) if current_label not in ['Note_OR_Comment', 'Unlabeled'] else None,
                 'final_label': final_label
             })
             
