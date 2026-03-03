@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # constants
 START_YEAR = 2004 # 1995 original
-END_YEAR = 2004 # 2015 original
+END_YEAR = 2004 # 2025 original
 OUTPUT_FOLDER = "downloads"
 RESULTS_CSV = "law_review_prelim_results.csv"
 FLAGGED_ISSUES_JSON = "flagged_issues.json"
@@ -31,6 +31,9 @@ DUKE_JOURNAL_START_YEAR = 1951
 
 PEPPERDINE_BASE_URL = "https://digitalcommons.pepperdine.edu/plr/vol{volume}/iss{issue}/{article}/"
 PEPPERDINE_JOURNAL_START_YEAR = 1974
+
+UCHICAGO_BASE_URL = "https://chicagounbound.uchicago.edu/uclrev/vol{volume}/iss{issue}/{article}/"
+UCHICAGO_JOURNAL_START_YEAR = 1933  # vol 62 is 1995
 
 # classification pipeline updated with LLM fallback
 
@@ -677,8 +680,16 @@ def main():
         start_year=START_YEAR,
         end_year=END_YEAR
     )
+
+    uchicago_results = scrape_law_journal(
+        journal_name='University of Chicago Law Review',
+        base_url=UCHICAGO_BASE_URL,
+        journal_start_year=UCHICAGO_JOURNAL_START_YEAR,
+        start_year=START_YEAR,
+        end_year=END_YEAR
+    )
     
-    results = duke_results + pepperdine_results
+    results = duke_results + pepperdine_results + uchicago_results
 
     if not results:
         print("no articles found. check url patterns and start years.")
